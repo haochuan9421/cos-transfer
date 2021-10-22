@@ -82,55 +82,81 @@ tasks.reduce(async (promise, task) => {
   await allFiles.reduce(async (promise, file, index) => {
     await promise;
     await new Promise((resolve, reject) => {
-      let buffer = Buffer.from("");
-      class CosWriteStream extends Writable {
-        _write(chunk, encoding, cb) {
-          buffer = Buffer.concat([buffer, chunk]);
-          process.nextTick(cb);
-        }
-      }
-      const writeStream = new CosWriteStream();
-
-      fromCos.getObject(
-        {
-          Bucket: from.Bucket,
-          Region: from.Region,
-          Key: file.Key,
-          Output: writeStream,
-        },
-        function (err, data) {
-          if (err) {
-            reject(err);
-            console.log("下载失败", file.Key, err);
-          } else {
-            // console.log("下载成功", file.Key);
-            const newKey = path.join(
-              task.toPrefix,
-              path.relative(task.fromPrefix, file.Key)
-            );
-            toCos.putObject(
-              {
-                Bucket: to.Bucket,
-                Region: to.Region,
-                Key: newKey,
-                Body: buffer,
-              },
-              function (err, data) {
-                if (err) {
-                  reject(err);
-                  console.log("上传失败", newKey, err);
-                } else {
-                  console.log(
-                    "转移成功",
-                    `${index + 1} ${file.Key} ---> ${newKey}`
-                  );
-                  resolve(data);
-                }
-              }
-            );
+      // 新的路径
+      const newKey = path.join(
+        task.toPrefix,
+        path.relative(task.fromPrefix, file.Key)
+      );
+      // 同一个存储桶之前使用复制接口
+      if (from.Bucket === to.Bucket && from.Region === to.Region) {
+        fromCos.sliceCopyFile(
+          {
+            Bucket: from.Bucket,
+            Region: from.Region,
+            Key: newKey,
+            CopySource: `${from.Bucket}.cos.${from.Region}.myqcloud.com/${file.Key}`,
+          },
+          function (err, data) {
+            if (err) {
+              reject(err);
+              console.log("复制失败", file.Key, err);
+            } else {
+              console.log(
+                "复制成功",
+                `${index + 1} ${file.Key} ---> ${newKey}`
+              );
+              resolve(data);
+            }
+          }
+        );
+      } else {
+        // 跨存储桶先下载再上传
+        let buffer = Buffer.from("");
+        class CosWriteStream extends Writable {
+          _write(chunk, encoding, cb) {
+            buffer = Buffer.concat([buffer, chunk]);
+            process.nextTick(cb);
           }
         }
-      );
+        const writeStream = new CosWriteStream();
+
+        fromCos.getObject(
+          {
+            Bucket: from.Bucket,
+            Region: from.Region,
+            Key: file.Key,
+            Output: writeStream,
+          },
+          function (err, data) {
+            if (err) {
+              reject(err);
+              console.log("下载失败", file.Key, err);
+            } else {
+              // console.log("下载成功", file.Key);
+              toCos.putObject(
+                {
+                  Bucket: to.Bucket,
+                  Region: to.Region,
+                  Key: newKey,
+                  Body: buffer,
+                },
+                function (err, data) {
+                  if (err) {
+                    reject(err);
+                    console.log("上传失败", newKey, err);
+                  } else {
+                    console.log(
+                      "转移成功",
+                      `${index + 1} ${file.Key} ---> ${newKey}`
+                    );
+                    resolve(data);
+                  }
+                }
+              );
+            }
+          }
+        );
+      }
     });
   }, Promise.resolve());
 }, Promise.resolve());
