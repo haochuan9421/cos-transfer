@@ -5,15 +5,15 @@ const COS = require("cos-nodejs-sdk-v5");
 const from = {
   SecretId: "",
   SecretKey: "",
-  Region: "ap-guangzhou",
-  Bucket: "szcloudplus-1302968899",
+  Region: "",
+  Bucket: "",
 };
 
 const to = {
   SecretId: "",
   SecretKey: "",
-  Region: "ap-guangzhou",
-  Bucket: "cdn-1302968899",
+  Region: "",
+  Bucket: "",
 };
 
 const fromCos = new COS({ SecretId: from.SecretId, SecretKey: from.SecretKey });
@@ -21,31 +21,15 @@ const toCos = new COS({ SecretId: to.SecretId, SecretKey: to.SecretKey });
 
 const tasks = [
   {
-    fromPrefix: "export/wzt-wj-server",
-    toPrefix: "p/wzt-wj-server/export",
-  },
-  {
-    fromPrefix: "public",
-    toPrefix: "p/wzt-wj-server/assets",
-  },
-  {
-    fromPrefix: "public",
-    toPrefix: "p/wj-server/assets",
-  },
-  {
-    fromPrefix: "upload/wzt-wj-server",
-    toPrefix: "p/wzt-wj-server/upload",
-  },
-  {
-    fromPrefix: "upload/wj-server",
-    toPrefix: "p/wj-server/upload",
+    fromPrefix: "foo/bar",
+    toPrefix: "p/foo/bar",
   },
 ];
 
-function getAllOldFiles(task) {
+const getTaskFiles = (task) => {
   return new Promise((resolve, reject) => {
     let files = [];
-    const listFolder = function (marker) {
+    const listFolder = (marker) => {
       fromCos.getBucket(
         {
           Bucket: from.Bucket,
@@ -55,18 +39,27 @@ function getAllOldFiles(task) {
           MaxKeys: 100,
           Delimiter: "",
         },
-        function (err, data) {
+        (err, data) => {
           if (err) {
-            return console.log("listFolder error", reject(err));
+            console.log("listFolder error", err);
+            reject(err);
           } else {
-            files = files.concat(
-              data.Contents.filter((item) => !item.Key.endsWith("/"))
-            );
+            const newFiles = data.Contents.filter(
+              (item) => !item.Key.endsWith("/")
+            ).map((file) => ({
+              ...file,
+              newKey: path.join(
+                task.toPrefix,
+                path.relative(task.fromPrefix, file.Key)
+              ),
+            }));
+            files = files.concat(newFiles);
+
             if (data.IsTruncated === "true") {
               listFolder(data.NextMarker);
             } else {
               resolve(files);
-              console.log("allFiles length", task, files.length);
+              console.log("task files length", task, files.length);
             }
           }
         }
@@ -74,89 +67,95 @@ function getAllOldFiles(task) {
     };
     listFolder();
   });
-}
+};
 
-tasks.reduce(async (promise, task) => {
-  await promise;
-  const allFiles = await getAllOldFiles(task);
-  await allFiles.reduce(async (promise, file, index) => {
-    await promise;
-    await new Promise((resolve, reject) => {
-      // 新的路径
-      const newKey = path.join(
-        task.toPrefix,
-        path.relative(task.fromPrefix, file.Key)
-      );
-      // 同一个存储桶之前使用复制接口
-      if (from.Bucket === to.Bucket && from.Region === to.Region) {
-        fromCos.sliceCopyFile(
-          {
-            Bucket: from.Bucket,
-            Region: from.Region,
-            Key: newKey,
-            CopySource: `${from.Bucket}.cos.${from.Region}.myqcloud.com/${file.Key}`,
-          },
-          function (err, data) {
-            if (err) {
-              reject(err);
-              console.log("复制失败", file.Key, err);
-            } else {
-              console.log(
-                "复制成功",
-                `${index + 1} ${file.Key} ---> ${newKey}`
-              );
-              resolve(data);
-            }
-          }
-        );
-      } else {
-        // 跨存储桶先下载再上传
-        let buffer = Buffer.from("");
-        class CosWriteStream extends Writable {
-          _write(chunk, encoding, cb) {
-            buffer = Buffer.concat([buffer, chunk]);
-            process.nextTick(cb);
-          }
-        }
-        const writeStream = new CosWriteStream();
-
-        fromCos.getObject(
-          {
-            Bucket: from.Bucket,
-            Region: from.Region,
-            Key: file.Key,
-            Output: writeStream,
-          },
-          function (err, data) {
-            if (err) {
-              reject(err);
-              console.log("下载失败", file.Key, err);
-            } else {
-              // console.log("下载成功", file.Key);
-              toCos.putObject(
-                {
-                  Bucket: to.Bucket,
-                  Region: to.Region,
-                  Key: newKey,
-                  Body: buffer,
-                },
-                function (err, data) {
-                  if (err) {
-                    reject(err);
-                    console.log("上传失败", newKey, err);
-                  } else {
-                    console.log(
-                      "转移成功",
-                      `${index + 1} ${file.Key} ---> ${newKey}`
-                    );
-                    resolve(data);
-                  }
-                }
-              );
-            }
-          }
-        );
+tasks
+  .reduce(async (promise, task) => {
+    const result = await promise;
+    const taskFiles = await getTaskFiles(task);
+    return result.concat(taskFiles);
+  }, Promise.resolve([]))
+  .then((allFiles) => {
+    let doneCount = 0;
+    const doTransfer = (file) => {
+      if (!file) {
+        return;
       }
-    });
-  }, Promise.resolve());
-}, Promise.resolve());
+      return new Promise((resolve, reject) => {
+        // 同一个存储桶之前使用复制接口
+        if (from.Bucket === to.Bucket && from.Region === to.Region) {
+          fromCos.sliceCopyFile(
+            {
+              Bucket: from.Bucket,
+              Region: from.Region,
+              Key: file.newKey,
+              CopySource: `${from.Bucket}.cos.${from.Region}.myqcloud.com/${file.Key}`,
+            },
+            function (err, data) {
+              if (err) {
+                reject(err);
+                console.log("复制失败", file.Key, err);
+              } else {
+                console.log(
+                  "复制成功",
+                  `${++doneCount} ${file.Key} ---> ${file.newKey}`
+                );
+                resolve(data);
+              }
+            }
+          );
+        } else {
+          // 跨存储桶先下载再上传
+          let buffer = Buffer.from("");
+          class CosWriteStream extends Writable {
+            _write(chunk, encoding, cb) {
+              buffer = Buffer.concat([buffer, chunk]);
+              process.nextTick(cb);
+            }
+          }
+          const writeStream = new CosWriteStream();
+
+          fromCos.getObject(
+            {
+              Bucket: from.Bucket,
+              Region: from.Region,
+              Key: file.Key,
+              Output: writeStream,
+            },
+            function (err, data) {
+              if (err) {
+                reject(err);
+                console.log("下载失败", file.Key, err);
+              } else {
+                // console.log("下载成功", file.Key);
+                toCos.putObject(
+                  {
+                    Bucket: to.Bucket,
+                    Region: to.Region,
+                    Key: file.newKey,
+                    Body: buffer,
+                  },
+                  function (err, data) {
+                    if (err) {
+                      reject(err);
+                      console.log("上传失败", file.newKey, err);
+                    } else {
+                      console.log(
+                        "转移成功",
+                        `${++doneCount} ${file.Key} ---> ${file.newKey}`
+                      );
+                      resolve(data);
+                    }
+                  }
+                );
+              }
+            }
+          );
+        }
+      }).then(() => doTransfer(allFiles.shift()));
+    };
+
+    for (let i = 0; i < 20; i++) {
+      doTransfer(allFiles.shift());
+    }
+  });
